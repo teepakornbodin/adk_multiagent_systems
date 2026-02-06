@@ -10,35 +10,43 @@ from google.adk.tools.langchain_tool import LangchainTool
 from google.genai import types
 from google.adk.tools import exit_loop
 
-# Import Wikipedia Tools
+# Wikipedia utilities
 from langchain_community.tools import WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 
-# Setup Logging
+
+# Initialize Cloud Logging
 cloud_logging_client = google.cloud.logging.Client()
 cloud_logging_client.setup_logging()
 
+# Load environment variables
 load_dotenv()
 
 model_name = os.getenv("MODEL")
 print(f"Using Model: {model_name}")
 
-# ==========================================
-# 1. TOOLS DEFINITION
-# ==========================================
+
+# =====================================================
+# SECTION 1 — TOOL FUNCTIONS
+# =====================================================
 
 def append_to_state(
     tool_context: ToolContext, field: str, response: str
 ) -> dict[str, str]:
-    """Append new output to an existing state key (pos_data, neg_data, etc.)."""
+    """
+    Store new information into a list-based state field
+    such as pos_data or neg_data.
+    """
     existing_state = tool_context.state.get(field, [])
-    # ตรวจสอบว่า existing_state เป็น list หรือไม่ ถ้าไม่ใช่ให้แปลงเป็น list
+
+    # Ensure the state value is always treated as a list
     if isinstance(existing_state, str):
         existing_state = [existing_state]
-        
+
     tool_context.state[field] = existing_state + [response]
-    logging.info(f"[Added to {field}] {response}")
+    logging.info(f"[State Updated → {field}] {response}")
     return {"status": "success"}
+
 
 def write_file(
     tool_context: ToolContext,
@@ -46,159 +54,176 @@ def write_file(
     filename: str,
     content: str
 ) -> dict[str, str]:
-    """Write the final verdict to a text file."""
+    """
+    Save the generated final report into a text file.
+    """
     target_path = os.path.join(directory, filename)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
     with open(target_path, "w", encoding="utf-8") as f:
         f.write(content)
+
     return {"status": "success"}
 
-# Wikipedia Tool Setup
-wiki_tool = LangchainTool(tool=WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper()))
 
-# ==========================================
-# 2. AGENTS DEFINITION (The Historical Court)
-# ==========================================
+# Prepare Wikipedia search tool
+wiki_tool = LangchainTool(
+    tool=WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
+)
 
-# --- Step 2: The Investigation (Parallel Agents) ---
 
-# Agent A: The Admirer (หาข้อมูลด้านบวก)
+# =====================================================
+# SECTION 2 — AGENT DEFINITIONS
+# =====================================================
+
+# -------------------------------
+# Investigation Stage (Parallel)
+# -------------------------------
+
+# Agent responsible for collecting positive facts
 admirer_agent = Agent(
     name="admirer_agent",
     model=model_name,
-    description="Researches positive achievements and successes.",
+    description="Collects achievements and positive historical contributions.",
     instruction="""
-    ROLE: You are 'The Admirer'. Your job is to find ONLY positive information, achievements, and virtues about the subject.
+    ROLE: You are 'The Admirer'. Focus ONLY on positive aspects, achievements, and contributions.
 
     SUBJECT: { PROMPT? }
     CURRENT JUDGE FEEDBACK: { judge_feedback? }
-    
-    INSTRUCTIONS:
-    - If 'judge_feedback' asks for specific positive details, search for those.
-    - Otherwise, search for the greatest achievements and legacy of the SUBJECT.
-    - Use the 'wikipedia' tool to find facts.
-    - Use 'append_to_state' to save your findings to the field 'pos_data'.
-    - Keep your summary brief and focused on the good side.
+
+    GUIDELINES:
+    - If the Judge provides feedback, refine your search accordingly.
+    - Otherwise, gather key achievements and long-term contributions.
+    - Use the Wikipedia tool for reliable information.
+    - Save results into 'pos_data' using append_to_state.
+    - Keep responses concise and positive.
     """,
     tools=[wiki_tool, append_to_state]
 )
 
-# Agent B: The Critic (หาข้อมูลด้านลบ/ข้อโต้แย้ง)
+
+# Agent responsible for collecting negative/critical facts
 critic_agent = Agent(
     name="critic_agent",
     model=model_name,
-    description="Researches controversies, failures, and criticisms.",
+    description="Collects controversies, criticisms, and negative history.",
     instruction="""
-    ROLE: You are 'The Critic'. Your job is to find ONLY negative information, controversies, crimes, or failures about the subject.
+    ROLE: You are 'The Critic'. Focus ONLY on controversies, failures, and negative aspects.
 
     SUBJECT: { PROMPT? }
     CURRENT JUDGE FEEDBACK: { judge_feedback? }
 
-    INSTRUCTIONS:
-    - If 'judge_feedback' asks for specific negative details, search for those.
-    - Otherwise, search for "controversy", "criticism", "failures", or "war crimes" of the SUBJECT.
-    - Use the 'wikipedia' tool to find facts.
-    - Use 'append_to_state' to save your findings to the field 'neg_data'.
-    - Keep your summary brief and focused on the bad side.
+    GUIDELINES:
+    - If the Judge provides feedback, refine your search accordingly.
+    - Otherwise, search for controversies, failures, crimes, or criticisms.
+    - Use the Wikipedia tool for factual data.
+    - Save results into 'neg_data' using append_to_state.
+    - Keep responses concise and critical-focused.
     """,
     tools=[wiki_tool, append_to_state]
 )
 
-# Group Step 2 into Parallel Execution
+
+# Run both research agents at the same time
 investigation_team = ParallelAgent(
     name="investigation_team",
     sub_agents=[admirer_agent, critic_agent]
 )
 
-# --- Step 3: The Trial & Review (The Judge) ---
 
-# Agent C: The Judge (ตรวจสอบความสมดุลและสั่งงานต่อ)
+# -------------------------------
+# Review Stage (Judge + Loop)
+# -------------------------------
+
 judge_agent = Agent(
     name="judge_agent",
     model=model_name,
-    description="Reviews the evidence and decides if more research is needed.",
+    description="Evaluates balance and completeness of collected evidence.",
     instruction="""
-    ROLE: You are 'The Judge'. You review the evidence collected by the Admirer and the Critic.
+    ROLE: You are 'The Judge'. Review the evidence gathered from both sides.
 
-    EVIDENCE FOR PROSECUTION (NEGATIVE):
+    NEGATIVE SIDE:
     { neg_data? }
 
-    EVIDENCE FOR DEFENSE (POSITIVE):
+    POSITIVE SIDE:
     { pos_data? }
 
-    INSTRUCTIONS:
-    1. Analyze the quantity and quality of the information in 'neg_data' and 'pos_data'.
-    2. DECISION LOGIC:
-       - If EITHER side has too little information or the arguments are weak/unbalanced:
-         -> Use 'append_to_state' to write specific instructions to 'judge_feedback' (e.g., "Critic, find more details on the 1990 scandal").
-         -> Do NOT exit the loop.
-       - If BOTH sides have sufficient and balanced information to form a verdict:
-         -> Use the 'exit_loop' tool to end the trial.
+    TASK:
+    1. Compare both sides in terms of completeness and balance.
+    2. DECISION:
+       - If one side lacks sufficient evidence:
+         -> Provide targeted feedback via 'judge_feedback'.
+         -> Continue the loop (do NOT exit).
+       - If both sides are sufficiently detailed and balanced:
+         -> Use 'exit_loop' to finish the trial phase.
     """,
     tools=[append_to_state, exit_loop]
 )
 
-# Group Step 2 & 3 into a Loop (The Trial Loop)
+
+# Loop combines investigation and evaluation until completion
 trial_process = LoopAgent(
     name="trial_process",
-    description="The loop of investigation and judicial review.",
+    description="Repeats investigation and review until balanced.",
     sub_agents=[
-        investigation_team, # Parallel search
-        judge_agent         # Check results
+        investigation_team,
+        judge_agent
     ],
-    max_iterations=4  # Limit loops to prevent infinite running
+    max_iterations=4  # Safety limit to prevent endless looping
 )
 
-# --- Step 4: The Verdict (Output) ---
+
+# -------------------------------
+# Final Report Generation
+# -------------------------------
 
 verdict_writer = Agent(
     name="verdict_writer",
     model=model_name,
-    description="Writes the final neutral report.",
+    description="Produces a balanced final historical report.",
     instruction="""
-    ROLE: You are the Court Clerk writing the final Verdict.
+    ROLE: Court Clerk responsible for writing the final verdict.
 
     SUBJECT: { PROMPT? }
     POSITIVE EVIDENCE: { pos_data? }
     NEGATIVE EVIDENCE: { neg_data? }
 
-    INSTRUCTIONS:
-    - Write a comprehensive, NEUTRAL report comparing the facts.
-    - Start with an introduction of the subject.
-    - Present the arguments from the Admirer (Achievements).
-    - Present the arguments from the Critic (Controversies).
-    - Conclude with a balanced verdict summarizing their historical impact.
-    - Use the 'write_file' tool to save this report:
-        - directory: "court_records"
-        - filename: "{PROMPT}.txt" (remove spaces for filename)
-        - content: The full report.
+    REQUIREMENTS:
+    - Produce a neutral and balanced historical report.
+    - Begin with an overview of the subject.
+    - Present positive contributions.
+    - Present criticisms and controversies.
+    - Conclude with an objective summary of historical impact.
+    - Save the report using 'write_file':
+        directory: "court_records"
+        filename: "{PROMPT}.txt"
+        content: full report
     """,
     tools=[write_file]
 )
 
-# ==========================================
-# 3. ROOT AGENT (Entry Point)
-# ==========================================
 
-# Step 1: The Inquiry (Sequential Wrapper)
-# รับชื่อจาก User -> เข้าสู่กระบวนการศาล -> เขียนรายงาน
+# =====================================================
+# SECTION 3 — ROOT AGENT (ENTRY POINT)
+# =====================================================
+
 root_agent = Agent(
     name="historical_court_clerk",
     model=model_name,
-    description="Starts the Historical Court session.",
+    description="Initializes and manages the Historical Court session.",
     instruction="""
-    - Greet the user and welcome them to 'The Historical Court'.
-    - Ask the user for the name of a historical figure or event they want to put on trial.
-    - Once the user provides a name, use 'append_to_state' to save it to 'PROMPT'.
-    - Then, handover to the 'court_system'.
+    - Welcome the user to the Historical Court.
+    - Ask for a historical figure or event to analyze.
+    - Store the provided subject into 'PROMPT'.
+    - Then proceed to the full court process.
     """,
     tools=[append_to_state],
     sub_agents=[
         SequentialAgent(
             name="court_system",
             sub_agents=[
-                trial_process,  # Loop (Investigate -> Judge)
-                verdict_writer  # Output
+                trial_process,
+                verdict_writer
             ]
         )
     ]
