@@ -1,0 +1,9 @@
+# กันไฟล์ความลับ
+.env
+
+# กันไฟล์ขยะ Python
+__pycache__/
+*.pyc
+
+# กันไฟล์ขยะ System
+.DS_Store
